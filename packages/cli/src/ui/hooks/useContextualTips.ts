@@ -32,6 +32,9 @@ interface UseContextualTipsOptions {
   tipHistory: TipHistory | null;
   addItem: (item: HistoryItemWithoutId, timestamp: number) => void;
   hideTips: boolean;
+  /** When provided, called instead of showing the 'context-critical' tip so
+   *  compression happens automatically rather than asking the user to do it. */
+  onAutoCompress?: () => Promise<void>;
 }
 
 export function useContextualTips({
@@ -42,6 +45,7 @@ export function useContextualTips({
   tipHistory,
   addItem,
   hideTips,
+  onAutoCompress,
 }: UseContextualTipsOptions): void {
   const prevStreamingState = useRef<StreamingState>(StreamingState.Idle);
   // Track whether the model was responding at any point before going idle,
@@ -86,13 +90,16 @@ export function useContextualTips({
     const tip = selectTip('post-response', tipContext, tipRegistry, tipHistory);
     if (tip) {
       tipHistory.recordShown(tip.id, sessionPromptCount);
-      addItem(
-        {
-          type: MessageType.INFO,
-          text: `💡 ${t(tip.content)}`,
-        },
-        Date.now(),
-      );
+      const showTip = () =>
+        addItem(
+          { type: MessageType.INFO, text: `💡 ${t(tip.content)}` },
+          Date.now(),
+        );
+      if (tip.autoCompress && onAutoCompress) {
+        onAutoCompress().catch(showTip);
+      } else {
+        showTip();
+      }
     }
   }, [
     streamingState,
@@ -102,5 +109,6 @@ export function useContextualTips({
     tipHistory,
     addItem,
     hideTips,
+    onAutoCompress,
   ]);
 }

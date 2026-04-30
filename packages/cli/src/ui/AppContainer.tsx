@@ -58,6 +58,7 @@ import {
   type PermissionMode,
   ToolConfirmationOutcome,
   type WaitingToolCall,
+  CompressionStatus,
 } from '@qwen-code/qwen-code-core';
 import { buildResumedHistoryItems } from './utils/resumeHistoryUtils.js';
 import {
@@ -955,6 +956,24 @@ export const AppContainer = (props: AppContainerProps) => {
     () => (tipsDisabled ? null : getTipHistory()),
     [tipsDisabled],
   );
+
+  const geminiClient = config.getGeminiClient();
+
+  const handleAutoCompress = useCallback(async () => {
+    if (!geminiClient) return;
+    const promptId = `auto-compress-${Date.now()}`;
+    const result = await geminiClient.tryCompressChat(promptId, true);
+    if (result.compressionStatus === CompressionStatus.COMPRESSED) {
+      historyManager.addItem(
+        {
+          type: MessageType.INFO,
+          text: `Context was automatically compressed (${result.originalTokenCount} → ${result.newTokenCount} tokens).`,
+        },
+        Date.now(),
+      );
+    }
+  }, [geminiClient, historyManager]);
+
   useContextualTips({
     streamingState,
     lastPromptTokenCount: sessionStats.lastPromptTokenCount,
@@ -963,6 +982,7 @@ export const AppContainer = (props: AppContainerProps) => {
     tipHistory,
     addItem: historyManager.addItem,
     hideTips: tipsDisabled,
+    onAutoCompress: handleAutoCompress,
   });
 
   // Track whether suggestions are visible for Tab key handling
@@ -986,8 +1006,6 @@ export const AppContainer = (props: AppContainerProps) => {
   }, []);
 
   // Auto-accept indicator — disabled on agent tabs (agents handle their own)
-  const geminiClient = config.getGeminiClient();
-
   const showAutoAcceptIndicator = useAutoAcceptIndicator({
     config,
     addItem: historyManager.addItem,

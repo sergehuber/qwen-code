@@ -89,6 +89,10 @@ import { checkNextSpeaker } from '../utils/nextSpeakerChecker.js';
 import { flatMapTextParts } from '../utils/partUtils.js';
 import { promptIdContext } from '../utils/promptIdContext.js';
 import { retryWithBackoff, isUnattendedMode } from '../utils/retry.js';
+import {
+  isContextLimitError,
+  getContextLimitMessage,
+} from '../utils/rateLimit.js';
 
 // Hook types and utilities
 import {
@@ -128,6 +132,9 @@ export interface SendMessageOptions {
   notificationDisplayText?: string;
   /** Model override from skill execution. When present, overrides the session model for this turn. */
   modelOverride?: string;
+  /** Set to true when this call is a transparent retry after a context-limit error + forced compression.
+   *  Prevents infinite retry loops — only one reactive compression retry is allowed per user turn. */
+  contextLimitRetried?: boolean;
 }
 
 const EMPTY_RELEVANT_AUTO_MEMORY_RESULT: RelevantAutoMemoryPromptResult = {
@@ -1150,9 +1157,49 @@ export class GeminiClient {
       if (event.type === GeminiEventType.ChatCompressed) {
         this.forceFullIdeContext = true;
       }
-
-      yield event;
       if (event.type === GeminiEventType.Error) {
+        // Reactive compression: if the error is a context-window overflow and
+        // this turn hasn't already been retried, force-compress the history and
+        // transparently re-send the original request. The orphaned user message
+        // is removed by SendMessageType.Retry inside the recursive call.
+        if (
+          !options?.contextLimitRetried &&
+          isContextLimitError(event.value.error)
+        ) {
+          const contextLimitMsg =
+            getContextLimitMessage(event.value.error) ??
+            'context limit exceeded';
+          debugLogger.warn(
+            `Context limit error detected (${contextLimitMsg}) — attempting forced compression and retry.`,
+          );
+          const compressed = await this.tryCompressChat(
+            prompt_id,
+            true,
+            signal,
+          );
+          if (compressed.compressionStatus === CompressionStatus.COMPRESSED) {
+            yield { type: GeminiEventType.ChatCompressed, value: compressed };
+            for await (const retryEvent of this.sendMessageStream(
+              request,
+              signal,
+              prompt_id,
+              {
+                ...(options ?? {}),
+                type: SendMessageType.Retry,
+                contextLimitRetried: true,
+              },
+              turns,
+            )) {
+              yield retryEvent;
+            }
+            return turn;
+          }
+          debugLogger.warn(
+            `Forced compression after context limit error did not succeed ` +
+              `(status: ${compressed.compressionStatus}) — surfacing original error.`,
+          );
+        }
+        yield event;
         if (arenaAgentClient) {
           const errorMsg =
             event.value instanceof Error
@@ -1163,10 +1210,32 @@ export class GeminiClient {
         this.lastApiCompletionTimestamp = Date.now();
         return turn;
       }
+      yield event;
     }
 
     // Track API completion time for thinking block idle cleanup
     this.lastApiCompletionTimestamp = Date.now();
+
+    // Post-generation compression: if the model's response pushed the token
+    // count above the threshold, compress now so any continuation (stop hook,
+    // next-speaker, or the user's next message) starts lean. Uses force=false
+    // so all the normal eligibility guards inside tryCompressChat still apply
+    // (threshold check, hasFailedCompressionAttempt, etc.).
+    if (!signal.aborted && !turn.pendingToolCalls.length) {
+      const postGenCompressed = await this.tryCompressChat(
+        prompt_id,
+        false,
+        signal,
+      );
+      if (
+        postGenCompressed.compressionStatus === CompressionStatus.COMPRESSED
+      ) {
+        yield {
+          type: GeminiEventType.ChatCompressed,
+          value: postGenCompressed,
+        };
+      }
+    }
 
     // Fire Stop hook through MessageBus (only if hooks are enabled and registered)
     // This must be done before any early returns to ensure hooks are always triggered

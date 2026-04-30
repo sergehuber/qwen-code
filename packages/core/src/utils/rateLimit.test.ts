@@ -9,6 +9,7 @@ import {
   getRateLimitErrorDetails,
   getRateLimitRetryDelayMs,
   isRateLimitError,
+  isContextLimitError,
 } from './rateLimit.js';
 import type { StructuredError } from '../core/turn.js';
 import type { HttpError } from './retry.js';
@@ -450,5 +451,116 @@ describe('rate-limit retry diagnostics', () => {
         error,
       }),
     ).toBe(60_000);
+  });
+});
+
+describe('isContextLimitError — detection paths', () => {
+  // OpenAI / OpenAI-compatible (Qwen, DashScope)
+  it('detects OpenAI ApiError with context_length_exceeded status', () => {
+    expect(
+      isContextLimitError({
+        error: {
+          code: 400,
+          message: "This model's maximum context length is 128000 tokens.",
+          status: 'context_length_exceeded',
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('detects OpenAI-style message with "maximum context length"', () => {
+    expect(
+      isContextLimitError(
+        new Error(
+          '{"error":{"code":400,"message":"This model\'s maximum context length is 32768 tokens, however you requested 40000 tokens.","status":"context_length_exceeded"}}',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('detects "context_length_exceeded" embedded in Error.message', () => {
+    expect(isContextLimitError(new Error('context_length_exceeded'))).toBe(
+      true,
+    );
+  });
+
+  // Gemini
+  it('detects Gemini StructuredError with "context window" message', () => {
+    expect(
+      isContextLimitError({
+        message: 'The prompt exceeds the context window.',
+      }),
+    ).toBe(true);
+  });
+
+  it('detects Gemini "input token count" phrasing', () => {
+    expect(
+      isContextLimitError({
+        message: 'Input token count 200001 exceeds the limit 200000.',
+        status: 400,
+      }),
+    ).toBe(true);
+  });
+
+  it('detects "request too large" phrasing', () => {
+    expect(
+      isContextLimitError(new Error('Request too large for this model')),
+    ).toBe(true);
+  });
+
+  // Generic
+  it('detects "token limit exceeded" phrasing', () => {
+    expect(
+      isContextLimitError(new Error('token limit exceeded for this model')),
+    ).toBe(true);
+  });
+
+  it('detects "prompt is too long" phrasing (Anthropic-style)', () => {
+    expect(isContextLimitError(new Error('prompt is too long'))).toBe(true);
+  });
+
+  it('detects "input too long" phrasing', () => {
+    expect(isContextLimitError({ message: 'input too long' })).toBe(true);
+  });
+
+  it('detects "context limit" phrasing', () => {
+    expect(isContextLimitError(new Error('Reached context limit'))).toBe(true);
+  });
+
+  it('detects "prompt_too_long" code in message', () => {
+    expect(
+      isContextLimitError({
+        error: { code: 400, message: 'prompt_too_long: input exceeds limit' },
+      }),
+    ).toBe(true);
+  });
+
+  // Negative cases — must not false-positive on rate-limit or generic 400 errors
+  it('does not match a plain rate-limit error', () => {
+    expect(
+      isContextLimitError({ message: 'Too many requests', status: 429 }),
+    ).toBe(false);
+  });
+
+  it('does not match an unrelated 400 error', () => {
+    expect(
+      isContextLimitError({
+        error: { code: 400, message: 'Invalid parameter: temperature' },
+      }),
+    ).toBe(false);
+  });
+
+  it('does not match null', () => {
+    expect(isContextLimitError(null)).toBe(false);
+  });
+
+  it('does not match an empty Error', () => {
+    expect(isContextLimitError(new Error('something went wrong'))).toBe(false);
+  });
+
+  it('is case-insensitive', () => {
+    expect(isContextLimitError(new Error('CONTEXT_LENGTH_EXCEEDED'))).toBe(
+      true,
+    );
   });
 });

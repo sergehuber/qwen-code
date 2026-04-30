@@ -29,7 +29,12 @@ import type { Config } from '../config/config.js';
 import { ApprovalMode } from '../config/config.js';
 import type { ModelsConfig } from '../models/modelsConfig.js';
 import { retryWithBackoff } from '../utils/retry.js';
-import { CompressionStatus, GeminiEventType, Turn } from './turn.js';
+import {
+  type ChatCompressionInfo,
+  CompressionStatus,
+  GeminiEventType,
+  Turn,
+} from './turn.js';
 
 vi.mock('../utils/retry.js', () => ({
   retryWithBackoff: vi.fn(async (fn) => await fn()),
@@ -953,6 +958,284 @@ describe('Gemini Client (client.ts)', () => {
   });
 
   describe('sendMessageStream', () => {
+    it('emits a compression event when the context was automatically compressed', async () => {
+      // Arrange
+      mockTurnRunFn.mockReturnValue(
+        (async function* () {
+          yield { type: 'content', value: 'Hello' };
+        })(),
+      );
+
+      const compressionInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.COMPRESSED,
+        originalTokenCount: 1000,
+        newTokenCount: 500,
+      };
+
+      vi.spyOn(client, 'tryCompressChat').mockResolvedValueOnce(
+        compressionInfo,
+      );
+
+      // Act
+      const stream = client.sendMessageStream(
+        [{ text: 'Hi' }],
+        new AbortController().signal,
+        'prompt-id-1',
+      );
+
+      const events = await fromAsync(stream);
+
+      // Assert
+      expect(events).toContainEqual({
+        type: GeminiEventType.ChatCompressed,
+        value: compressionInfo,
+      });
+    });
+
+    it.each([
+      {
+        compressionStatus:
+          CompressionStatus.COMPRESSION_FAILED_INFLATED_TOKEN_COUNT,
+      },
+      { compressionStatus: CompressionStatus.NOOP },
+    ])(
+      'does not emit a compression event when the status is $compressionStatus',
+      async ({ compressionStatus }) => {
+        // Arrange
+        const mockStream = (async function* () {
+          yield { type: 'content', value: 'Hello' };
+        })();
+        mockTurnRunFn.mockReturnValue(mockStream);
+
+        const compressionInfo: ChatCompressionInfo = {
+          compressionStatus,
+          originalTokenCount: 1000,
+          newTokenCount: 500,
+        };
+
+        vi.spyOn(client, 'tryCompressChat').mockResolvedValueOnce(
+          compressionInfo,
+        );
+
+        // Act
+        const stream = client.sendMessageStream(
+          [{ text: 'Hi' }],
+          new AbortController().signal,
+          'prompt-id-1',
+        );
+
+        const events = await fromAsync(stream);
+
+        // Assert
+        expect(events).not.toContainEqual({
+          type: GeminiEventType.ChatCompressed,
+          value: expect.anything(),
+        });
+      },
+    );
+
+    // ── Reactive context-limit compression ────────────────────────────────────
+
+    it('compresses and retries transparently when a context-limit error is received', async () => {
+      // Arrange: first turn yields a context-limit Error; retry yields Content.
+      const contextLimitError = {
+        message: 'context_length_exceeded',
+        status: 400,
+      };
+      mockTurnRunFn
+        .mockReturnValueOnce(
+          (async function* () {
+            yield {
+              type: GeminiEventType.Error,
+              value: { error: contextLimitError },
+            };
+          })(),
+        )
+        .mockReturnValueOnce(
+          (async function* () {
+            yield {
+              type: GeminiEventType.Content,
+              value: 'Retried successfully',
+            };
+          })(),
+        );
+
+      const noopInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.NOOP,
+        originalTokenCount: 0,
+        newTokenCount: 0,
+      };
+      const compressedInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.COMPRESSED,
+        originalTokenCount: 5000,
+        newTokenCount: 2000,
+      };
+
+      // Call order: proactive (start of first turn) → reactive (on error) →
+      // proactive (start of retry) → post-gen (after retry) — all subsequent NOOP.
+      vi.spyOn(client, 'tryCompressChat')
+        .mockResolvedValue(noopInfo)
+        .mockResolvedValueOnce(noopInfo) // 1. proactive before first turn
+        .mockResolvedValueOnce(compressedInfo); // 2. reactive on context-limit error
+
+      // Act
+      const events = await fromAsync(
+        client.sendMessageStream(
+          [{ text: 'Hello' }],
+          new AbortController().signal,
+          'prompt-id-ctx',
+        ),
+      );
+
+      // Assert: ChatCompressed emitted, Content from retry present, no Error surfaced.
+      expect(events).toContainEqual({
+        type: GeminiEventType.ChatCompressed,
+        value: compressedInfo,
+      });
+      expect(events).toContainEqual({
+        type: GeminiEventType.Content,
+        value: 'Retried successfully',
+      });
+      expect(events).not.toContainEqual(
+        expect.objectContaining({ type: GeminiEventType.Error }),
+      );
+    });
+
+    it('surfaces the error when context-limit compression does not succeed', async () => {
+      // Arrange: context-limit error, but compression returns NOOP (e.g. history too short).
+      const contextLimitError = {
+        message: 'maximum context length exceeded',
+        status: 400,
+      };
+      mockTurnRunFn.mockReturnValue(
+        (async function* () {
+          yield {
+            type: GeminiEventType.Error,
+            value: { error: contextLimitError },
+          };
+        })(),
+      );
+
+      const noopInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.NOOP,
+        originalTokenCount: 0,
+        newTokenCount: 0,
+      };
+      vi.spyOn(client, 'tryCompressChat').mockResolvedValue(noopInfo);
+
+      // Act
+      const events = await fromAsync(
+        client.sendMessageStream(
+          [{ text: 'Hello' }],
+          new AbortController().signal,
+          'prompt-id-ctx-fail',
+        ),
+      );
+
+      // Assert: the original error is surfaced.
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: GeminiEventType.Error }),
+      );
+    });
+
+    it('does not retry a second time when contextLimitRetried flag is set', async () => {
+      // Arrange: both turns (original + retry) yield a context-limit error.
+      // mockImplementation creates a fresh generator per call so neither is exhausted.
+      const contextLimitError = {
+        message: 'context_length_exceeded',
+        status: 400,
+      };
+      mockTurnRunFn.mockImplementation(() =>
+        (async function* () {
+          yield {
+            type: GeminiEventType.Error,
+            value: { error: contextLimitError },
+          };
+        })(),
+      );
+
+      const noopInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.NOOP,
+        originalTokenCount: 0,
+        newTokenCount: 0,
+      };
+      const compressedInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.COMPRESSED,
+        originalTokenCount: 5000,
+        newTokenCount: 2000,
+      };
+
+      vi.spyOn(client, 'tryCompressChat')
+        .mockResolvedValue(noopInfo)
+        .mockResolvedValueOnce(noopInfo) // proactive before first turn
+        .mockResolvedValueOnce(compressedInfo); // reactive on first error (triggers retry)
+      // The retry turn also errors, but contextLimitRetried=true → no further attempt.
+
+      const events = await fromAsync(
+        client.sendMessageStream(
+          [{ text: 'Hello' }],
+          new AbortController().signal,
+          'prompt-id-ctx-guard',
+        ),
+      );
+
+      // Assert: compression fired once, but the second error is still surfaced.
+      expect(events).toContainEqual({
+        type: GeminiEventType.ChatCompressed,
+        value: compressedInfo,
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: GeminiEventType.Error }),
+      );
+    });
+
+    // ── Post-generation compression ───────────────────────────────────────────
+
+    it('compresses after turn completion when token count is above threshold', async () => {
+      // Arrange: normal turn, no error. Post-gen check returns COMPRESSED.
+      mockTurnRunFn.mockReturnValue(
+        (async function* () {
+          yield { type: GeminiEventType.Content, value: 'A long response' };
+        })(),
+      );
+
+      const noopInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.NOOP,
+        originalTokenCount: 0,
+        newTokenCount: 0,
+      };
+      const compressedInfo: ChatCompressionInfo = {
+        compressionStatus: CompressionStatus.COMPRESSED,
+        originalTokenCount: 8000,
+        newTokenCount: 3000,
+      };
+
+      // Call order: proactive (start of turn) → post-gen (after turn).
+      vi.spyOn(client, 'tryCompressChat')
+        .mockResolvedValue(noopInfo)
+        .mockResolvedValueOnce(noopInfo) // 1. proactive before turn
+        .mockResolvedValueOnce(compressedInfo); // 2. post-gen after turn
+
+      // Act
+      const events = await fromAsync(
+        client.sendMessageStream(
+          [{ text: 'Hello' }],
+          new AbortController().signal,
+          'prompt-id-postgen',
+        ),
+      );
+
+      // Assert: Content present and ChatCompressed emitted after turn.
+      expect(events).toContainEqual({
+        type: GeminiEventType.Content,
+        value: 'A long response',
+      });
+      expect(events).toContainEqual({
+        type: GeminiEventType.ChatCompressed,
+        value: compressedInfo,
+      });
+    });
+
     it('should include editor context when ideMode is enabled', async () => {
       // Arrange
       vi.mocked(ideContextStore.get).mockReturnValue({

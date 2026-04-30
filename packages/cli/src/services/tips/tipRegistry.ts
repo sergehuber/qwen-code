@@ -27,6 +27,8 @@ export interface ContextualTip {
   isRelevant: (ctx: TipContext) => boolean;
   cooldownPrompts: number;
   priority: number;
+  /** When true, consumers may trigger automatic compression instead of showing this tip. */
+  autoCompress?: boolean;
 }
 
 export function getContextUsagePercent(ctx: TipContext): number {
@@ -44,6 +46,7 @@ export const tipRegistry: ContextualTip[] = [
     isRelevant: (ctx) => getContextUsagePercent(ctx) >= 95,
     cooldownPrompts: 3,
     priority: 100,
+    autoCompress: true,
   },
   {
     id: 'context-high',
