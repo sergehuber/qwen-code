@@ -361,10 +361,12 @@ function hasResponseHeaders(error: unknown): error is {
 //   "maximum context length", "max_tokens is too large", "prompt_too_long"
 // - Gemini: "context window", "token count exceeds", "request too large"
 // - Anthropic: "prompt is too long", "input too long"
+// - Qwen/local providers: "exceeds the available context size"
 // - Generic: "token limit exceeded", "context limit"
 const CONTEXT_LIMIT_FRAGMENTS = [
   'context_length_exceeded',
   'maximum context length',
+  'exceeds the available context size',
   'context window',
   'token limit exceeded',
   'context limit',

@@ -206,6 +206,8 @@ export interface BugCommandSettings {
 
 export interface ChatCompressionSettings {
   contextPercentageThreshold?: number;
+  /** When true, automatically send "continue" after a compression event so the model resumes without manual intervention. */
+  autoContinue?: boolean;
 }
 
 /**
@@ -2530,6 +2532,12 @@ export class Config {
   }
 
   getChatCompression(): ChatCompressionSettings | undefined {
+    if (this.approvalMode === ApprovalMode.YOLO) {
+      return {
+        autoContinue: true,
+        ...this.chatCompression,
+      };
+    }
     return this.chatCompression;
   }
 

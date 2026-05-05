@@ -381,6 +381,7 @@ export const useGeminiStream = (
   }, [toolCalls]);
 
   const loopDetectedRef = useRef(false);
+  const chatCompressedThisTurnRef = useRef(false);
   const [
     loopDetectionConfirmationRequest,
     setLoopDetectionConfirmationRequest,
@@ -1079,6 +1080,7 @@ export const useGeminiStream = (
       eventValue: ServerGeminiChatCompressedEvent['value'],
       userMessageTimestamp: number,
     ) => {
+      chatCompressedThisTurnRef.current = true;
       if (pendingHistoryItemRef.current) {
         addItem(pendingHistoryItemRef.current, userMessageTimestamp);
         setPendingHistoryItem(null);
@@ -1504,6 +1506,7 @@ export const useGeminiStream = (
 
       // Set the flag to indicate we're now executing
       isSubmittingQueryRef.current = true;
+      chatCompressedThisTurnRef.current = false;
 
       const userMessageTimestamp = Date.now();
 
@@ -2303,6 +2306,18 @@ export const useGeminiStream = (
       registry.setNotificationCallback(undefined);
     };
   }, [config]);
+
+  // When idle after a compression event, auto-submit "continue" if the setting is enabled.
+  useEffect(() => {
+    if (
+      streamingState === StreamingState.Idle &&
+      chatCompressedThisTurnRef.current &&
+      config.getChatCompression()?.autoContinue
+    ) {
+      chatCompressedThisTurnRef.current = false;
+      void submitQuery('continue');
+    }
+  }, [streamingState, config, submitQuery]);
 
   // When idle, drain the unified queue one item at a time.
   useEffect(() => {
